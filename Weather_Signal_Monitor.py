@@ -122,7 +122,7 @@ def load_all_models():
     return models
 
 # -------------------- Fetch Weather Forecast --------------------
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=3600)
 def fetch_weather_forecast(latitude, longitude):
     """Fetch hourly weather forecast data for the next 24 hours."""
     url = "https://api.open-meteo.com/v1/forecast"
@@ -199,19 +199,6 @@ def predict_with_model(model_data, input_df):
     except Exception as e:
         st.error(f"Error making predictions: {e}")
         return None, None
-
-# -------------------- Monitoring History Update --------------------
-def update_monitoring_history(history, timestamp, predictions, probabilities, weather_conditions):
-    """Append latest prediction to monitoring history (keep max 24 entries)."""
-    new_entry = {
-        "timestamp": timestamp,
-        "predictions": predictions.copy(),
-        "probabilities": probabilities.copy(),
-        "weather": weather_conditions.copy()
-    }
-
-    history.append(new_entry)
-    return history[-24:]
 
 # -------------------- Monitoring History Update with Location --------------------
 def update_monitoring_history(history, timestamp, predictions, probabilities, weather_conditions, location):
