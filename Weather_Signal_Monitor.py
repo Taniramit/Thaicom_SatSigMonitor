@@ -1,3 +1,4 @@
+
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import pandas as pd
@@ -230,7 +231,7 @@ def update_monitoring_history(history, timestamp, predictions, probabilities, we
 
 def main():
 
-    st_autorefresh(interval=10 * 1000, key="datarefresh")
+    st_autorefresh(interval=60 * 1000, key="datarefresh")
 
     # -------------------- Initialize Session State --------------------
     if 'monitoring_history' not in st.session_state:
@@ -268,8 +269,9 @@ def main():
     latitude = st.sidebar.number_input("Latitude", value=latitude, format="%.4f")
     longitude = st.sidebar.number_input("Longitude", value=longitude, format="%.4f")
 
-    next_update = st.session_state['last_update'] + timedelta(hours=1)
-    st.sidebar.info(f"⏰ Next auto-update: {next_update.strftime('%H:00:00')}")
+    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    st.sidebar.info(f"⏰ Next prediction scheduled: {next_hour.strftime('%H:%M:%S')}")
+
     if st.sidebar.button("🔄 Refresh Now"):
         st.cache_data.clear()
         st.rerun()
@@ -287,7 +289,21 @@ def main():
             st.error("❌ Unable to fetch weather forecast data. Please check your internet connection.")
             return
 
-        current_idx = 1 if len(weather_data) > 1 else 0
+        # Find the row that matches the current hour (rounded down)
+        current_time = datetime.now().replace(minute=0, second=0, microsecond=0)
+
+        # Find index of the matching time in weather_data
+        if "time" in weather_data.columns:
+            match_row = weather_data[weather_data["time"] == current_time]
+            if not match_row.empty:
+                current_idx = match_row.index[0]
+            else:
+                st.warning("⚠️ No forecast data available for the current hour.")
+                current_idx = 0
+        else:
+            st.warning("⚠️ Weather data missing 'time' column.")
+            current_idx = 0
+
         all_predictions = {}
         all_probabilities = {}
 
@@ -313,8 +329,12 @@ def main():
             'Diffuse Radiation': weather_data.get('diffuse_radiation', [0])[current_idx],
         }
 
-        if not st.session_state.monitoring_history or \
-           (now - st.session_state.monitoring_history[-1]['timestamp']).total_seconds() >= 10:
+        if not st.session_state.monitoring_history or (
+            now.minute == 0 and (
+                st.session_state['monitoring_history'][-1]['timestamp'].hour != now.hour or
+                st.session_state['monitoring_history'][-1]['timestamp'].date() != now.date()
+            )
+        ):
             predictions = {m: all_predictions[m][current_idx] for m in models}
             probabilities = {m: all_probabilities[m][current_idx] for m in models}
             st.session_state.monitoring_history = update_monitoring_history(
@@ -554,4 +574,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
