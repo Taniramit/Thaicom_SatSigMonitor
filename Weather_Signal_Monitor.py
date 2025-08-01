@@ -9,7 +9,7 @@ import xgboost
 import sklearn
 
 import pickle
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import time
 
@@ -135,7 +135,7 @@ def fetch_weather_forecast(latitude, longitude):
             "precipitation", "soil_moisture_9_to_27cm", "soil_temperature_54cm", "dew_point_2m", "uv_index",
             "evapotranspiration", "wind_speed_80m", "diffuse_radiation", "relative_humidity_2m", "shortwave_radiation"
         ]),
-        "timezone": "auto",
+        "timezone": "Asia/Bangkok",
         "start_date": datetime.now().strftime("%Y-%m-%d"),
         "end_date": (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     }
@@ -263,6 +263,8 @@ def main():
 
     if st.sidebar.button("🔄 Refresh Now"):
         st.cache_data.clear()
+        st.session_state['monitoring_history'] = []
+        st.session_state['last_update'] = datetime.now()
         st.rerun()
 
     # -------------------- Tabs --------------------
@@ -271,17 +273,18 @@ def main():
     # -------------------- Tab 1: Hourly Monitoring --------------------
     with tab1:
         st.header("Real-time Signal Drop Monitoring")
-        st.markdown("*Monitoring data every hour with weather forecast predictions*")
+        st.markdown("*This system predicts hourly signal drops at any location using weather-based features and pre-trained classification models.*")
+        st.write("Model selection: RandomForest, LinearSVC, and XGBoost")
 
         weather_data = fetch_weather_forecast(latitude, longitude)
         if weather_data is None or weather_data.empty:
             st.error("❌ Unable to fetch weather forecast data. Please check your internet connection.")
             return
+        
+        weather_data["time"] = pd.to_datetime(weather_data["time"])
+        weather_data["time"] = weather_data["time"].dt.floor("H")
+        current_time = datetime.now(timezone(timedelta(hours=7))).replace(minute=0, second=0, microsecond=0).replace(tzinfo=None)
 
-        # Find the row that matches the current hour (rounded down)
-        current_time = datetime.now().replace(minute=0, second=0, microsecond=0)
-
-        # Find index of the matching time in weather_data
         if "time" in weather_data.columns:
             match_row = weather_data[weather_data["time"] == current_time]
             if not match_row.empty:
@@ -292,6 +295,8 @@ def main():
         else:
             st.warning("⚠️ Weather data missing 'time' column.")
             current_idx = 0
+
+
 
         all_predictions = {}
         all_probabilities = {}
@@ -311,11 +316,15 @@ def main():
         # -------------------- Current Conditions & Auto History Update --------------------
         current_weather = {
             'Precipitation': weather_data.get('precipitation', [0])[current_idx],
-            'Humidity': weather_data.get('relative_humidity_2m', [0])[current_idx],
-            'Wind Speed': weather_data.get('wind_speed_80m', [0])[current_idx],
+            'Soil Moisture': weather_data.get('soil_moisture_9_to_27cm', [0])[current_idx],
+            'Soil Temperature': weather_data.get('soil_temperature_54cm', [0])[current_idx],
+            'Dew Point': weather_data.get('dew_point_2m',[0])[current_idx],
             'UV Index': weather_data.get('uv_index', [0])[current_idx],
             'Evapotranspiration': weather_data.get('evapotranspiration', [0])[current_idx],
+            'Wind Speed': weather_data.get('wind_speed_80m', [0])[current_idx],
             'Diffuse Radiation': weather_data.get('diffuse_radiation', [0])[current_idx],
+            'Humidity': weather_data.get('relative_humidity_2m', [0])[current_idx],
+            'Shortwave Radiation': weather_data.get('shortwave_radiation',[0])[current_idx]
         }
 
         if not st.session_state.monitoring_history or (
@@ -334,6 +343,55 @@ def main():
                 current_weather,
                 location
             )
+        # -------------------- Weather Metrics --------------------
+        st.write("---")
+        st.subheader("🌤️ Current Weather Conditions",help="features data from Open-Meteo forecast API")
+        st.markdown("*Data from Open-Meteo forecast API*")
+        labels = list(current_weather.keys())
+        values = list(current_weather.values())
+
+        # Create one column per metric
+        weather_cols = st.columns(len(labels))
+
+        # Define consistent box style
+        box_style = """
+            background: #121211;
+            border-radius: 10px;
+            border-style: solid;
+            border-color: #ffffff;
+            padding: 12px;
+            margin: 0 -5px;
+            text-align: center;
+            box-shadow: 0px 2px 5px rgba(0,0,0,0.05);
+        """
+
+        for col, label, value in zip(weather_cols, labels, values):
+            if "Soil Temperature" in label:
+                unit = "°C"
+            elif "Soil Moisture" in label:
+                unit = "m³/m³"
+            elif "Precipitation" in label or "Evapotranspiration" in label:
+                unit = "mm"
+            elif "Wind Speed" in label:
+                unit = "m/s"
+            elif "Diffuse Radiation" in label or "Shortwave Radiation" in label:
+                unit = "W/m²"
+            elif "Humidity" in label:
+                unit = "%"
+            elif "Dew Point" in label:
+                unit = "°C"
+            elif "UV Index" in label:
+                unit = ""
+            else:
+                unit = ''
+            
+            # Custom box layout with inline HTML
+            col.markdown(f"""
+                <div style="{box_style}">
+                    <div style="font-size: clamp(0.8rem,1.5vw,0.8rem); color: #ffffff; white-space: nowrap; overflow: hidden;">{label}</div>
+                    <div style="font-size: clamp(1rem,1.3rem); color: #ffffff; width: 100%;white-space: nowrap;">{value:.1f} {unit}</div>
+                </div>
+            """, unsafe_allow_html=True)
 
         # -------------------- Display Controls --------------------
         st.subheader("🎯 Choose Models to Display")
@@ -365,22 +423,37 @@ def main():
                             border: {border}; text-align: center;">
                     <h3>{model_name}</h3>
                     <h2 style="color: {color}; margin: 0;">{status}</h2>
-                    <h3 style="margin-top: 5px;">{prob:.1%} Risk</h3>
+                    <h3 style="margin-top: 5px;">{prob:.1%} probability</h3>
                 </div>
                 """, unsafe_allow_html=True)
 
-        # -------------------- Weather Metrics --------------------
-        st.subheader("🌤️ Current Weather Conditions")
-        labels = list(current_weather.keys())
-        values = list(current_weather.values())
-        weather_cols = st.columns(len(labels))
-        for col, label, value in zip(weather_cols, labels, values):
-            unit = "%" if "Humidity" in label else "mm" if "Precipitation" in label else "m/s"
-            col.metric(label, f"{value:.1f} {unit}")
+        # -------------------- Monitoring Table --------------------
+        st.write(" ")
+        if st.session_state.monitoring_history:
+            history_data = []
+            for entry in st.session_state.monitoring_history[-12:]:
+                row = {
+                    'Time': entry['timestamp'].strftime('%m/%d/%y %H:%M'),
+                    'Location': entry.get('location', 'Unknown')
+                }
+                prob_values = []
+                for model_name in selected_models:
+                    pred = entry['predictions'].get(model_name, 0)
+                    prob = entry['probabilities'].get(model_name, 0)
+                    row[f"{model_name}"] = f"{'🚨' if pred == 1 else '✅'} {prob:.1%}"
+                    prob_values.append(prob)
+
+                if prob_values:
+                    avg_prob = sum(prob_values)/len(prob_values)
+                    row["Average Probability"] = f"{avg_prob:.1%}"
+                else:
+                    row["Average Probability"] = "N/A"    
+                history_data.append(row)
+
+            st.dataframe(pd.DataFrame(history_data), use_container_width=True)
 
         # -------------------- Risk History Chart --------------------
         if st.session_state.monitoring_history:
-            st.subheader("📈 Signal Drop Risk History")
             fig = go.Figure()
             times = [entry['timestamp'] for entry in st.session_state.monitoring_history]
             for i, model_name in enumerate(selected_models):
@@ -396,26 +469,6 @@ def main():
                 yaxis=dict(range=[0, 1]), height=500, hovermode='x unified'
             )
             st.plotly_chart(fig, use_container_width=True)
-
-        # -------------------- Monitoring Table --------------------
-        if st.session_state.monitoring_history:
-            st.subheader("📊 Monitoring History")
-            history_data = []
-            for entry in st.session_state.monitoring_history[-12:]:
-                row = {
-                    'Time': entry['timestamp'].strftime('%m/%d %H:%M'),
-                    'Wind Speed': f"{entry['weather']['Wind Speed']:.1f} m/s",
-                    'Humidity': f"{entry['weather']['Humidity']:.0f}%",
-                    'Precipitation': f"{entry['weather']['Precipitation']:.1f} mm",
-                    'UV Index': f"{entry['weather']['UV Index']:.1f}",
-                    'Location': entry.get('location', 'Unknown')
-                }
-                for model_name in selected_models:
-                    pred = entry['predictions'].get(model_name, 0)
-                    prob = entry['probabilities'].get(model_name, 0)
-                    row[f"{model_name}"] = f"{'🚨' if pred == 1 else '✅'} {prob:.1%}"
-                history_data.append(row)
-            st.dataframe(pd.DataFrame(history_data), use_container_width=True)
 
         # -------------------- Feature Importance --------------------
         st.subheader("🔍 Model Feature Importance")
@@ -440,8 +493,7 @@ def main():
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("Feature importance not available for this model.")
-
-
+        st.markdown("---")
 
 #------------------------------ Tab 2: Manual Parameter Testing --------------------
     with tab2:
@@ -518,7 +570,9 @@ def main():
 
                 with result_cols[i]:
                     st.markdown(f"""
-                    <div style="padding: 15px; border-radius: 10px; background-color: rgba({255 if prediction else 0}, {0 if prediction else 255}, 0, 0.1); border: 2px solid {color}; text-align: center;">
+                    <div style="padding: 15px; border-radius: 10px;
+                        background-color: rgba({255 if prediction else 0}, {0 if prediction else 255}, 0, 0.1);
+                        border: 2px solid {color}; text-align: center; text-size: clamp width:100%; ">
                         <h4>{model_name}</h4>
                         <h3 style="color: {color};">{label}</h3>
                         <h4>{probability:.1%} probability</h4>
