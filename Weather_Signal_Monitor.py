@@ -445,7 +445,7 @@ def main():
 
                 if prob_values:
                     avg_prob = sum(prob_values)/len(prob_values)
-                    row["Average Probability"] = f"{avg_prob:.1%}"
+                    row["Average Probability"] = f"{'🚨' if avg_prob > 0.5 else '✅'}  {avg_prob:.1%}"
                 else:
                     row["Average Probability"] = "N/A"    
                 history_data.append(row)
@@ -602,13 +602,13 @@ def main():
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     avg_prob = np.mean(list(results["probabilities"].values()))
-                    st.metric("Average Risk", f"{avg_prob:.1%}")
+                    st.metric("Average probability", f"{avg_prob:.1%}")
                 with col2:
                     drop_count = sum(1 for p in results["predictions"].values() if p == 1)
                     st.metric("Models Predicting Drop", f"{drop_count}/{len(results['predictions'])}")
                 with col3:
                     max_prob = max(results["probabilities"].values())
-                    st.metric("Highest Risk", f"{max_prob:.1%}")
+                    st.metric("Highest probability", f"{max_prob:.1%}")
 
         # -------------------- Footer --------------------
         st.markdown("---")
