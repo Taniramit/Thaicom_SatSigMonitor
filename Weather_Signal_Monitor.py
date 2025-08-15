@@ -13,6 +13,9 @@ from copy import deepcopy
 import glob
 import joblib
 
+# Import the new component for tab management
+from streamlit_option_menu import option_menu
+
 # Import ML libraries
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
@@ -39,21 +42,19 @@ st.markdown("""
         padding: 2rem; border-radius: 10px; color: white;
         text-align: center; margin-bottom: 2rem;
     }
-    .stTabs [data-baseweb="tab-list"] {
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 3rem;
-        padding: 0 2rem;
+    /* Style for the option_menu to look like standard tabs */
+    div[data-testid="stOptionMenu"] > div > button {
         background-color: #f1f3f4;
         color: #333;
-        border-radius: 10px 10px 0 0;
+        border-radius: 10px 10px 0 0 !important;
     }
-    .stTabs [aria-selected="true"] {
+    div[data-testid="stOptionMenu"] > div > button[aria-selected="true"] {
         background-color: #007bff;
-        color: black;
+        color: white;
     }
     </style>
 """, unsafe_allow_html=True)
+
 
 # =================================================================================
 # SCRIPT CONFIGURATION (Single Source of Truth)
@@ -71,6 +72,8 @@ MODEL_BASE_NAMES = {
     "XGBoost": "xgb_model",
     "Linear SVC": "svc_model"
 }
+# Define Bangkok Timezone (UTC+7)
+BKK_TZ = timezone(timedelta(hours=7))
 
 # =================================================================================
 # CORE FUNCTIONS
@@ -163,8 +166,8 @@ def main():
         latitude = st.number_input("Latitude", value=lat_default, format="%.4f")
         longitude = st.number_input("Longitude", value=lon_default, format="%.4f")
         
-        now = datetime.now()
-        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        now_bkk_sidebar = datetime.now(BKK_TZ)
+        next_hour = (now_bkk_sidebar + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         st.info(f"⏰ Next prediction scheduled: {next_hour.strftime('%H:%M:%S')}")
         
         if st.button("🔄 Refresh Data & Rerun"):
@@ -177,16 +180,20 @@ def main():
         st.session_state.last_location = current_location_tuple
         st.cache_data.clear()
 
-    tab1, tab2, tab3 = st.tabs(["📊 Hourly Monitoring", "🔧 Manual Testing", "🦾 Model Retraining"])
+    selected_tab = option_menu(
+        menu_title=None,
+        options=["📊 Hourly Monitoring", "🔧 Manual Testing", "🦾 Model Retraining"],
+        icons=['graph-up', 'wrench-adjustable-circle', 'robot'],
+        menu_icon="cast", default_index=0, orientation="horizontal",
+    )
 
-    with tab1:
+    if selected_tab == "📊 Hourly Monitoring":
         st_autorefresh(interval=60 * 1000, key="datarefresh")
         st.header("Real-time Signal Drop Monitoring")
-        weather_data = fetch_weather_data(latitude, longitude, datetime.now(), datetime.now() + timedelta(days=1))
+        weather_data = fetch_weather_data(latitude, longitude, datetime.now(BKK_TZ), datetime.now(BKK_TZ) + timedelta(days=1))
         if weather_data.empty: st.stop()
 
-        bkk_tz = timezone(timedelta(hours=7))
-        now_bkk = datetime.now(bkk_tz)
+        now_bkk = datetime.now(BKK_TZ)
         current_hour_naive = now_bkk.replace(minute=0, second=0, microsecond=0, tzinfo=None)
         
         current_row = weather_data[weather_data["time"] == current_hour_naive]
@@ -203,10 +210,10 @@ def main():
         is_preset_location = math.isclose(latitude, lat_default) and math.isclose(longitude, lon_default)
         location_display_name = location_option if is_preset_location else f"{latitude:.3f}, {longitude:.3f}"
 
-        if not st.session_state.monitoring_history or (st.session_state.monitoring_history[-1]['timestamp'].hour != now.hour):
+        if not st.session_state.monitoring_history or (st.session_state.monitoring_history[-1]['timestamp'].hour != now_bkk.hour):
             current_weather_values = current_row[FINAL_FEATURES].iloc[0].to_dict()
             st.session_state.monitoring_history = update_monitoring_history(
-                st.session_state.monitoring_history, now, all_predictions, all_probabilities, current_weather_values, location_display_name
+                st.session_state.monitoring_history, now_bkk, all_predictions, all_probabilities, current_weather_values, location_display_name
             )
         
         st.subheader("🌤️ Current Weather Conditions")
@@ -262,7 +269,7 @@ def main():
                         df = pd.DataFrame({'Feature': features, 'Coefficient': abs(model_obj.coef_[0])}).sort_values("Coefficient", ascending=True)
                         st.plotly_chart(px.bar(df, x="Coefficient", y="Feature", orientation="h", title=f"{name} Feature Coefficients"), use_container_width=True)
 
-    with tab2:
+    if selected_tab == "🔧 Manual Testing":
         st.header("🔧 Manual Parameter Testing")
         with st.form("manual_input_form"):
             manual_input = {}
@@ -280,13 +287,25 @@ def main():
                             status, color, bg = ("🚨 SIGNAL DROP", "red", "rgba(255,0,0,0.1)") if pred[0] == 1 else ("✅ STABLE", "green", "rgba(0,255,0,0.1)")
                             st.markdown(f'<div style="border: 2px solid {color}; background-color: {bg}; border-radius: 10px; padding: 1rem; text-align: center; height: 100%;"><h3>{name}</h3><h2 style="color:{color};">{status}</h2><h4>{prob[0]:.1%} probability</h4></div>', unsafe_allow_html=True)
                             
-    with tab3:
+    if selected_tab == "🦾 Model Retraining":
         st.header("🦾 Model Retraining with New Data")
         
         uploaded_file = st.file_uploader("📁 Upload CSV ('time' or '_time', and 'Rx_EsNo')", type=["csv"])
         c1, c2 = st.columns(2)
         user_lat = c1.number_input("Latitude of data location", format="%.4f", value=15.4719, key="retrain_lat")
         user_lon = c2.number_input("Longitude of data location", format="%.4f", value=98.6433, key="retrain_lon")
+        
+        st.divider()
+        
+        st.subheader("1. Select Base Model Versions for Retraining")
+        selected_model_files = {}
+        for name, base_name in MODEL_BASE_NAMES.items():
+            versions = sorted(glob.glob(f"{base_name}*.pkl"))
+            if not versions:
+                st.warning(f"No versions found for {name}.")
+                selected_model_files[name] = None
+            else:
+                selected_model_files[name] = st.selectbox(f"Choose base model for **{name}**:", options=versions, index=len(versions) - 1, format_func=os.path.basename)
         
         if st.button("🚀 Start Retraining", disabled=(uploaded_file is None), use_container_width=True, type="primary"):
             def haversine_km(lat1, lon1, lat2, lon2):
@@ -309,7 +328,7 @@ def main():
                 signal_df["drop"] = (signal_df["Rx_EsNo"] <= (baseline_db - DROP_DELTA_DB)).astype(int)
 
                 start_date, end_date = signal_df['time'].min(), signal_df['time'].max()
-                api_to_use = "archive" if start_date < (datetime.now() - timedelta(days=60)) else "forecast"
+                api_to_use = "archive" if start_date < (datetime.now(BKK_TZ) - timedelta(days=60)) else "forecast"
                 st.info(f"Data is {'older than 60 days' if api_to_use == 'archive' else 'recent'}. Using the Open-Meteo **{api_to_use}** API.")
 
                 weather_df = fetch_weather_data(user_lat, user_lon, start_date, end_date, api=api_to_use)
@@ -326,8 +345,7 @@ def main():
                 drop_counts = y_all.value_counts()
                 st.info(f"Data Labeling Results: Stable Signals (0): {drop_counts.get(0, 0)}, Signal Drops (1): {drop_counts.get(1, 0)}")
                 if y_all.nunique() < 2:
-                    st.error("Training Failed: The provided data resulted in only one class. Models require examples of both signal drops and stable signals to learn.")
-                    st.stop()
+                    st.error("Training Failed: The provided data resulted in only one class."); st.stop()
                 
                 X_train, X_test, y_train, y_test = train_test_split(X_all, y_all, test_size=0.2, random_state=RANDOM_STATE, stratify=y_all)
                 
@@ -337,10 +355,13 @@ def main():
                 
                 retrained_models, performance_data = {}, []
 
-                for name, data in models.items():
-                    original_scaler = data['scaler']
-                    X_test_scaled_for_orig = original_scaler.transform(X_test_imputed)
-                    y_pred_orig, _ = predict_with_model(data, pd.DataFrame(X_test_scaled_for_orig, columns=FINAL_FEATURES))
+                for name, filepath in selected_model_files.items():
+                    if filepath is None: continue
+                    with open(filepath, "rb") as f:
+                        original_bundle = joblib.load(f)
+                    original_bundle['features'] = FINAL_FEATURES
+                    
+                    y_pred_orig, _ = predict_with_model(original_bundle, pd.DataFrame(X_test, columns=FINAL_FEATURES))
                     
                     new_scaler = StandardScaler().fit(X_train_imputed)
                     X_train_scaled, X_test_scaled = new_scaler.transform(X_train_imputed), new_scaler.transform(X_test_imputed)
@@ -351,7 +372,7 @@ def main():
                     else:
                         X_train_bal, y_train_bal = X_train_scaled, y_train
 
-                    new_model = deepcopy(data['model'])
+                    new_model = deepcopy(original_bundle['model'])
                     new_model.fit(X_train_bal, y_train_bal)
                     y_pred_new = new_model.predict(X_test_scaled)
 
@@ -366,7 +387,7 @@ def main():
                 st.rerun()
 
         if st.session_state.retraining_results:
-            st.subheader("📊 Performance Comparison & Model Selection")
+            st.subheader("2. Performance Comparison & Model Selection")
             with st.form("model_selection_form"):
                 user_choices = {}
                 perf_df = pd.DataFrame(st.session_state.retraining_results["performance"])
@@ -395,12 +416,11 @@ def main():
                                 joblib.dump(st.session_state.retraining_results["models"][name], new_filename)
                                 st.success(f"✅ Saved **{name}** to `{full_path}`.")
                             else:
-                                st.info(f"Keeping original model for **{name}**.")
+                                st.info(f"Kept original model for **{name}**.")
                     
                     del st.session_state.retraining_results
                     st.success("Process complete! Refresh the page to load the latest models.")
                     st.balloons()
-                    st.rerun()
 
 if __name__ == "__main__":
     main()
