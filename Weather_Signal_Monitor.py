@@ -292,8 +292,8 @@ def main():
         
         uploaded_file = st.file_uploader("📁 Upload CSV ('time' or '_time', and 'Rx_EsNo')", type=["csv"])
         c1, c2 = st.columns(2)
-        user_lat = c1.number_input("Latitude of data location", format="%.4f", value=15.4719, key="retrain_lat")
-        user_lon = c2.number_input("Longitude of data location", format="%.4f", value=98.6433, key="retrain_lon")
+        user_lat = c1.number_input("Latitude of data location", format="%.4f", value=00.00, key="retrain_lat")
+        user_lon = c2.number_input("Longitude of data location", format="%.4f", value=00.00, key="retrain_lon")
         
         st.divider()
         
