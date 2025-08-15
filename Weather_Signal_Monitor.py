@@ -5,14 +5,25 @@ import numpy as np
 import requests
 import plotly.express as px
 import plotly.graph_objects as go
-import xgboost
-import sklearn
-
 import pickle
 from datetime import datetime, timedelta, timezone
 import os
-import time
+import math
+from copy import deepcopy
+import glob
+import joblib
 
+# Import ML libraries
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, accuracy_score, f1_score, precision_score, recall_score
+from imblearn.combine import SMOTETomek
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import LinearSVC
+from xgboost import XGBClassifier
+
+# --- Page Configuration ---
 st.set_page_config(
     page_title="Signal Drop Monitor",
     page_icon="📡",
@@ -25,39 +36,8 @@ st.markdown("""
     <style>
     .main-header {
         background: linear-gradient(90deg, #1e3c72 0%, #2a5298 100%);
-        padding: 2rem;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .prediction-card {
-        padding: 1.5rem;
-        transition: transform 0.2s;
-        border-radius: 15px;
-        text-align: center;
-        margin: 1rem 0;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        height: 100%;
-    }
-    .prediction-card:hover { transform: translateY(-2px); }
-    .danger-card {
-        background: linear-gradient(135deg, #ff6b6b, #ee5a52);
-        color: white;
-        border: 2px solid #ff4757;
-        height: 100%;
-    }
-    .safe-card {
-        background: linear-gradient(135deg, #51cf66, #40c057);
-        color: white;
-        border: 2px solid #2ed573;
-        height: 100%;
-    }
-    .metric-container {
-        background: #f8f9fa;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 4px solid #007bff;
+        padding: 2rem; border-radius: 10px; color: white;
+        text-align: center; margin-bottom: 2rem;
     }
     .stTabs [data-baseweb="tab-list"] {
     }
@@ -75,545 +55,352 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# =================================================================================
+# SCRIPT CONFIGURATION (Single Source of Truth)
+# =================================================================================
 
-# -------------------- Main Features --------------------
-MAIN_FEATURES = [
-    "precipitation", "soil_moisture_9_to_27cm", "soil_temperature_54cm", 
-    "dew_point_2m", "uv_index", "evapotranspiration", "wind_speed_80m", 
-    "diffuse_radiation", "relative_humidity_2m", "shortwave_radiation"
+FINAL_FEATURES = [
+    "precipitation (mm)", "lifted_index ()", "dew_point_2m (°C)", "cape (J/kg)",
+    "soil_moisture_27_to_81cm (m³/m³)", "evapotranspiration (mm)",
+    "soil_moisture_9_to_27cm (m³/m³)", "cloud_cover (%)", "surface_pressure (hPa)",
+    "relative_humidity_2m (%)", "wind_speed_80m (m/s)", "temperature_2m (°C)"
 ]
-# -------------------- Load ML Models --------------------
+API_FEATURES = [name.split(' ')[0] for name in FINAL_FEATURES]
+MODEL_BASE_NAMES = {
+    "Random Forest": "rf_model",
+    "XGBoost": "xgb_model",
+    "Linear SVC": "svc_model"
+}
+
+# =================================================================================
+# CORE FUNCTIONS
+# =================================================================================
+
 @st.cache_resource
 def load_all_models():
-    """Load pre-trained ML models along with their features and scalers."""
-    model_files = {
-        "Random Forest": "rf_model.pkl",
-        "Linear SVC": "svc_model.pkl", 
-        "XGBoost": "xgb_model.pkl"
-    }
-
     models = {}
-    for name, path in model_files.items():
-        if not os.path.exists(path):
-            st.warning(f"⚠️ {name} file not found: {path}")
+    for name, base_filename in MODEL_BASE_NAMES.items():
+        model_files = glob.glob(f"{base_filename}*.pkl")
+        if not model_files:
+            st.warning(f"⚠️ No model file for {name} found.")
             continue
-
+        latest_file = sorted(model_files, reverse=True)[0]
         try:
-            with open(path, "rb") as f:
-                model_bundle = pickle.load(f)
-
-            # Unpack model bundle
-            if isinstance(model_bundle, dict):
-                model = model_bundle.get("model")
-                features = model_bundle.get("features", MAIN_FEATURES)
-                scaler = model_bundle.get("scaler", None)
-            else:
-                model = model_bundle
-                features = MAIN_FEATURES
-                scaler = None
-
-            models[name] = {
-                "model": model,
-                "features": features,
-                "scaler": scaler
-            }
-
+            with open(latest_file, "rb") as f:
+                bundle = joblib.load(f)
+            bundle['features'] = FINAL_FEATURES
+            models[name] = {**bundle, "filename": latest_file}
         except Exception as e:
-            st.error(f"❌ Error loading {name}: {e}")
-
+            st.error(f"❌ Error loading {name} from `{latest_file}`: {e}")
     return models
 
-# -------------------- Fetch Weather Forecast --------------------
 @st.cache_data(ttl=3600)
-def fetch_weather_forecast(latitude, longitude):
-    """Fetch hourly weather forecast data for the next 24 hours."""
-    url = "https://api.open-meteo.com/v1/forecast"
+def fetch_weather_data(latitude, longitude, start_date, end_date, api="forecast"):
+    base_url = "https://api.open-meteo.com/v1/forecast" if api == "forecast" else "https://archive-api.open-meteo.com/v1/archive"
     params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "hourly": ",".join([
-            "precipitation", "soil_moisture_9_to_27cm", "soil_temperature_54cm", "dew_point_2m", "uv_index",
-            "evapotranspiration", "wind_speed_80m", "diffuse_radiation", "relative_humidity_2m", "shortwave_radiation"
-        ]),
-        "timezone": "Asia/Bangkok",
-        "start_date": datetime.now().strftime("%Y-%m-%d"),
-        "end_date": (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        "latitude": latitude, "longitude": longitude, "hourly": ",".join(API_FEATURES),
+        "start_date": start_date.strftime("%Y-%m-%d"), "end_date": end_date.strftime("%Y-%m-%d"),
+        "timezone": "Asia/Bangkok"
     }
-
     try:
-        with st.spinner("🌤️ Fetching weather forecast data..."):
-            response = requests.get(url, params=params, timeout=15)
-            if response.status_code == 200:
-                hourly = response.json().get("hourly", {})
-                df = pd.DataFrame(hourly)
-                if "time" in df.columns:
-                    df["time"] = pd.to_datetime(df["time"])
-                return df
-            else:
-                st.error(f"Failed to fetch weather data: HTTP {response.status_code}")
+        with st.spinner(f"🌤️ Fetching weather {api} data..."):
+            response = requests.get(base_url, params=params, timeout=20)
+            response.raise_for_status()
+            df = pd.DataFrame(response.json()['hourly'])
+            df["time"] = pd.to_datetime(df["time"])
+            api_to_final_map = {api_feat: final_feat for api_feat, final_feat in zip(API_FEATURES, FINAL_FEATURES)}
+            df.rename(columns=api_to_final_map, inplace=True)
+            return df
     except Exception as e:
         st.error(f"Error fetching weather data: {e}")
+        return pd.DataFrame()
 
-    return None
-# -------------------- Prepare Input for ML Model --------------------
-def prepare_model_input(weather_df, model_features):
-    """Return DataFrame with expected feature order and filled missing columns."""
-    if weather_df is None or model_features is None:
-        return None
-
-    df = weather_df.copy()
-
-    # Add missing columns as 0.0
-    for feature in model_features:
-        if feature not in df.columns:
-            st.warning(f"Feature '{feature}' not found. Using default value 0.")
-            df[feature] = 0.0
-
-    return df[model_features].fillna(0)
-
-# -------------------- Predict with Model --------------------
 def predict_with_model(model_data, input_df):
-    """Make predictions using a model and return class + probability."""
-    if model_data is None or input_df is None:
-        return None, None
-
+    if not isinstance(model_data, dict) or input_df is None or input_df.empty: return None, None
     try:
-        model = model_data["model"]
-        scaler = model_data.get("scaler")
-
-        # Apply scaling if needed
-        input_array = scaler.transform(input_df) if scaler else input_df
-
-        # Predict class
-        predictions = model.predict(input_array)
-
-        # Predict probabilities
+        model, scaler, threshold = model_data["model"], model_data["scaler"], model_data.get("threshold", 0.5)
+        if not isinstance(input_df, pd.DataFrame):
+            input_df = pd.DataFrame(input_df, columns=model_data["features"])
+        input_df_ordered = input_df[model_data["features"]]
+        input_scaled = scaler.transform(input_df_ordered)
         if hasattr(model, 'predict_proba'):
-            drop_prob = model.predict_proba(input_array)[:, 1]
-        elif hasattr(model, 'decision_function'):
-            scores = model.decision_function(input_array)
-            drop_prob = 1 / (1 + np.exp(-scores))  # Sigmoid function
+            scores = model.predict_proba(input_scaled)[:, 1]
         else:
-            drop_prob = np.array([np.nan] * len(predictions))
-
-        return predictions, drop_prob
-
+            scores_raw = model.decision_function(input_scaled)
+            scores = 1 / (1 + np.exp(-scores_raw))
+        predictions = (scores >= threshold).astype(int)
+        return predictions, scores
     except Exception as e:
-        st.error(f"Error making predictions: {e}")
+        st.error(f"Prediction Error for {model_data.get('filename', 'model')}: {e}")
         return None, None
 
-# -------------------- Monitoring History Update with Location --------------------
 def update_monitoring_history(history, timestamp, predictions, probabilities, weather_conditions, location):
-    """Append latest prediction to monitoring history (keep max 24 entries)."""
     new_entry = {
-        "timestamp": timestamp,
-        "location": location,
-        "predictions": predictions.copy(),
-        "probabilities": probabilities.copy(),
-        "weather": weather_conditions.copy()
+        "timestamp": timestamp, "location": location, "predictions": predictions.copy(),
+        "probabilities": probabilities.copy(), "weather": weather_conditions.copy()
     }
-
     history.append(new_entry)
     return history[-24:]
 
-# -------------------- Main Function --------------------
+# =================================================================================
+# MAIN APP LAYOUT
+# =================================================================================
 
 def main():
+    if 'monitoring_history' not in st.session_state: st.session_state['monitoring_history'] = []
+    if 'last_location' not in st.session_state: st.session_state['last_location'] = None
+    if 'retraining_results' not in st.session_state: st.session_state['retraining_results'] = None
 
-    st_autorefresh(interval=60 * 1000, key="datarefresh")
-
-    # -------------------- Initialize Session State --------------------
-    if 'monitoring_history' not in st.session_state:
-        st.session_state['monitoring_history'] = []
-
-    if 'last_update' not in st.session_state:
-        st.session_state['last_update'] = datetime.now()
-
-    if 'manual_results' not in st.session_state:
-        st.session_state['manual_results'] = {}
-    # -------------------- Header --------------------
-    st.markdown("""
-    <div class="main-header">
-        <h1>📡 Signal Drop Monitor</h1>
-        <p>Advanced ML-powered monitoring with real-time weather data</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # -------------------- Load Models --------------------
+    st.markdown("<div class='main-header'><h1>📡 Signal Drop Monitor</h1><p>Advanced ML-powered monitoring with real-time, location-aware weather data</p></div>", unsafe_allow_html=True)
+    
     models = load_all_models()
-    if not models:
-        st.error("❌ No models loaded. Please check your model files.")
-        st.stop()
-    # -------------------- Auto Refresh Logic (Every Hour) --------------------
-    now = datetime.now()
-    # -------------------- Sidebar Location Selection --------------------
-    st.sidebar.header("📍 Location Settings")
-    location = st.sidebar.radio("Select Location", ["Thaicom SJ Infinite Building", "Thaicom Lat Lum Kaeo Station"])
+    if not models: st.stop()
 
-    if location == "Thaicom SJ Infinite Building":
-        latitude, longitude = 13.809, 100.558
-    else:
-        latitude, longitude = 14.053, 100.331
-
-    latitude = st.sidebar.number_input("Latitude", value=latitude, format="%.4f")
-    longitude = st.sidebar.number_input("Longitude", value=longitude, format="%.4f")
-
-    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    st.sidebar.info(f"⏰ Next prediction scheduled: {next_hour.strftime('%H:%M:%S')}")
-
-    if st.sidebar.button("🔄 Refresh Now"):
-        st.cache_data.clear()
-        st.session_state['monitoring_history'] = []
-        st.session_state['last_update'] = datetime.now()
-        st.rerun()
-
-    # -------------------- Tabs --------------------
-    tab1, tab2 = st.tabs(["📊 Hourly Monitoring", "🔧 Manual Testing"])
-
-    # -------------------- Tab 1: Hourly Monitoring --------------------
-    with tab1:
-        st.header("Real-time Signal Drop Monitoring")
-        st.markdown("*This system predicts hourly signal drops at any location using weather-based features and pre-trained classification models.*")
-        st.write("Model selection: RandomForest, LinearSVC, and XGBoost")
-
-        weather_data = fetch_weather_forecast(latitude, longitude)
-        if weather_data is None or weather_data.empty:
-            st.error("❌ Unable to fetch weather forecast data. Please check your internet connection.")
-            return
+    with st.sidebar:
+        st.header("📍 Location Settings")
+        location_option = st.radio("Select Location", ["Thaicom Capital Tower", "Thaicom Lat Lum Kaeo Station"])
+        lat_default, lon_default = (13.739, 100.547) if "Capital Tower" in location_option else (14.053, 100.331)
+        latitude = st.number_input("Latitude", value=lat_default, format="%.4f")
+        longitude = st.number_input("Longitude", value=lon_default, format="%.4f")
         
-        weather_data["time"] = pd.to_datetime(weather_data["time"])
-        weather_data["time"] = weather_data["time"].dt.floor("H")
-        current_time = datetime.now(timezone(timedelta(hours=7))).replace(minute=0, second=0, microsecond=0).replace(tzinfo=None)
+        now = datetime.now()
+        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        st.info(f"⏰ Next prediction scheduled: {next_hour.strftime('%H:%M:%S')}")
+        
+        if st.button("🔄 Refresh Data & Rerun"):
+            st.cache_data.clear(); st.cache_resource.clear(); st.rerun()
 
-        if "time" in weather_data.columns:
-            match_row = weather_data[weather_data["time"] == current_time]
-            if not match_row.empty:
-                current_idx = match_row.index[0]
-            else:
-                st.warning("⚠️ No forecast data available for the current hour.")
-                current_idx = 0
-        else:
-            st.warning("⚠️ Weather data missing 'time' column.")
-            current_idx = 0
+    current_location_tuple = (location_option, latitude, longitude)
+    if st.session_state.last_location != current_location_tuple:
+        st.toast("Location changed. Fetching new data...")
+        st.session_state.monitoring_history = []
+        st.session_state.last_location = current_location_tuple
+        st.cache_data.clear()
 
+    tab1, tab2, tab3 = st.tabs(["📊 Hourly Monitoring", "🔧 Manual Testing", "🦾 Model Retraining"])
 
+    with tab1:
+        st_autorefresh(interval=60 * 1000, key="datarefresh")
+        st.header("Real-time Signal Drop Monitoring")
+        weather_data = fetch_weather_data(latitude, longitude, datetime.now(), datetime.now() + timedelta(days=1))
+        if weather_data.empty: st.stop()
 
-        all_predictions = {}
-        all_probabilities = {}
+        bkk_tz = timezone(timedelta(hours=7))
+        now_bkk = datetime.now(bkk_tz)
+        current_hour_naive = now_bkk.replace(minute=0, second=0, microsecond=0, tzinfo=None)
+        
+        current_row = weather_data[weather_data["time"] == current_hour_naive]
+        if current_row.empty:
+            st.warning("Data for current hour not available. Using first forecast hour.")
+            current_row = weather_data.iloc[[0]]
 
-        for model_name, model_data in models.items():
-            model_input = prepare_model_input(weather_data, model_data["features"])
-            if model_input is not None:
-                predictions, probabilities = predict_with_model(model_data, model_input)
-                if predictions is not None:
-                    all_predictions[model_name] = predictions
-                    all_probabilities[model_name] = probabilities
+        all_predictions, all_probabilities = {}, {}
+        for name, data in models.items():
+            preds, probs = predict_with_model(data, current_row)
+            if preds is not None:
+                all_predictions[name] = preds[0]; all_probabilities[name] = probs[0]
+        
+        is_preset_location = math.isclose(latitude, lat_default) and math.isclose(longitude, lon_default)
+        location_display_name = location_option if is_preset_location else f"{latitude:.3f}, {longitude:.3f}"
 
-        if not all_predictions:
-            st.error("❌ Unable to make predictions with current weather data.")
-            return
-
-        # -------------------- Current Conditions & Auto History Update --------------------
-        current_weather = {
-            'Precipitation': weather_data.get('precipitation', [0])[current_idx],
-            'Soil Moisture': weather_data.get('soil_moisture_9_to_27cm', [0])[current_idx],
-            'Soil Temperature': weather_data.get('soil_temperature_54cm', [0])[current_idx],
-            'Dew Point': weather_data.get('dew_point_2m',[0])[current_idx],
-            'UV Index': weather_data.get('uv_index', [0])[current_idx],
-            'Evapotranspiration': weather_data.get('evapotranspiration', [0])[current_idx],
-            'Wind Speed': weather_data.get('wind_speed_80m', [0])[current_idx],
-            'Diffuse Radiation': weather_data.get('diffuse_radiation', [0])[current_idx],
-            'Humidity': weather_data.get('relative_humidity_2m', [0])[current_idx],
-            'Shortwave Radiation': weather_data.get('shortwave_radiation',[0])[current_idx]
-        }
-
-        if not st.session_state.monitoring_history or (
-            now.minute == 0 and (
-                st.session_state['monitoring_history'][-1]['timestamp'].hour != now.hour or
-                st.session_state['monitoring_history'][-1]['timestamp'].date() != now.date()
-            )
-        ):
-            predictions = {m: all_predictions[m][current_idx] for m in models}
-            probabilities = {m: all_probabilities[m][current_idx] for m in models}
+        if not st.session_state.monitoring_history or (st.session_state.monitoring_history[-1]['timestamp'].hour != now.hour):
+            current_weather_values = current_row[FINAL_FEATURES].iloc[0].to_dict()
             st.session_state.monitoring_history = update_monitoring_history(
-                st.session_state.monitoring_history,
-                now,
-                predictions,
-                probabilities,
-                current_weather,
-                location
+                st.session_state.monitoring_history, now, all_predictions, all_probabilities, current_weather_values, location_display_name
             )
-        # -------------------- Weather Metrics --------------------
-        st.write("---")
-        st.subheader("🌤️ Current Weather Conditions",help="features data from Open-Meteo forecast API")
-        st.markdown("*Data from Open-Meteo forecast API*")
-        labels = list(current_weather.keys())
-        values = list(current_weather.values())
-
-        # Create one column per metric
-        weather_cols = st.columns(len(labels))
-
-        # Define consistent box style
-        box_style = """
-            background: #121211;
-            border-radius: 10px;
-            border-style: solid;
-            border-color: #ffffff;
-            padding: 12px;
-            margin: 0 -5px;
-            text-align: center;
-            box-shadow: 0px 2px 5px rgba(0,0,0,0.05);
-        """
-
-        for col, label, value in zip(weather_cols, labels, values):
-            if "Soil Temperature" in label:
-                unit = "°C"
-            elif "Soil Moisture" in label:
-                unit = "m³/m³"
-            elif "Precipitation" in label or "Evapotranspiration" in label:
-                unit = "mm"
-            elif "Wind Speed" in label:
-                unit = "m/s"
-            elif "Diffuse Radiation" in label or "Shortwave Radiation" in label:
-                unit = "W/m²"
-            elif "Humidity" in label:
-                unit = "%"
-            elif "Dew Point" in label:
-                unit = "°C"
-            elif "UV Index" in label:
-                unit = ""
-            else:
-                unit = ''
-            
-            # Custom box layout with inline HTML
-            col.markdown(f"""
-                <div style="{box_style}">
-                    <div style="font-size: clamp(0.8rem,1.5vw,0.8rem); color: #ffffff; white-space: nowrap; overflow: hidden;">{label}</div>
-                    <div style="font-size: clamp(1rem,1.3rem); color: #ffffff; width: 100%;white-space: nowrap;">{value:.1f} {unit}</div>
-                </div>
-            """, unsafe_allow_html=True)
-
-        # -------------------- Display Controls --------------------
+        
+        st.subheader("🌤️ Current Weather Conditions")
+        cols = st.columns(4)
+        for i, feature in enumerate(FINAL_FEATURES):
+            cols[i % 4].metric(label=feature, value=f"{current_row.iloc[0].get(feature, 0):.2f}")
+        
+        st.divider()
         st.subheader("🎯 Choose Models to Display")
-        selected_models = st.multiselect(
-            "Select models:",
-            options=list(models.keys()),
-            default=list(models.keys())
-        )
+        selected_models = st.multiselect("Select models:", options=list(models.keys()), default=list(models.keys()))
 
-        if not selected_models:
-            st.warning("Please select at least one model to display.")
-            return
-
-        # -------------------- Prediction Cards --------------------
-        st.subheader("🚨 Signal Drop Predictions (Next Hour)")
-        cols = st.columns(len(selected_models))
-        for i, model_name in enumerate(selected_models):
-            pred = all_predictions[model_name][current_idx]
-            prob = all_probabilities[model_name][current_idx]
-            color = "red" if pred == 1 else "green"
-            status = "🚨 SIGNAL DROP" if pred == 1 else "✅ STABLE"
-            bg = "rgba(255, 0, 0, 0.1)" if pred == 1 else "rgba(0, 255, 0, 0.1)"
-            border = f"2px solid {color}"
-
-            with cols[i]:
-                st.markdown(f"""
-                <div style="height: 25vh; display: flex; flex-direction: column; justify-content: center; 
-                            align-items: center; border-radius: 10px; background-color: {bg}; 
-                            border: {border}; text-align: center;">
-                    <h3>{model_name}</h3>
-                    <h2 style="color: {color}; margin: 0;">{status}</h2>
-                    <h3 style="margin-top: 5px;">{prob:.1%} probability</h3>
-                </div>
-                """, unsafe_allow_html=True)
-
-        # -------------------- Monitoring Table --------------------
-        st.write(" ")
-        if st.session_state.monitoring_history:
+        if selected_models:
+            st.subheader("🚨 Signal Drop Predictions (Current Hour)")
+            pred_cols = st.columns(len(selected_models))
+            for i, name in enumerate(selected_models):
+                pred, prob = all_predictions.get(name, 0), all_probabilities.get(name, 0)
+                status, color, bg = ("🚨 SIGNAL DROP", "red", "rgba(255,0,0,0.1)") if pred == 1 else ("✅ STABLE", "green", "rgba(0,255,0,0.1)")
+                with pred_cols[i]:
+                    st.markdown(f'<div style="border: 2px solid {color}; background-color: {bg}; border-radius: 10px; padding: 1rem; text-align: center; height: 100%;"><h3>{name}</h3><h2 style="color:{color};">{status}</h2><h4>{prob:.1%} probability</h4></div>', unsafe_allow_html=True)
+        
+        st.divider()
+        if st.session_state.monitoring_history and selected_models:
+            st.subheader("📊 Hourly Prediction History")
             history_data = []
-            for entry in st.session_state.monitoring_history[-12:]:
-                row = {
-                    'Time': entry['timestamp'].strftime('%m/%d/%y %H:%M'),
-                    'Location': entry.get('location', 'Unknown')
-                }
-                prob_values = []
-                for model_name in selected_models:
-                    pred = entry['predictions'].get(model_name, 0)
-                    prob = entry['probabilities'].get(model_name, 0)
-                    row[f"{model_name}"] = f"{'🚨' if pred == 1 else '✅'} {prob:.1%}"
-                    prob_values.append(prob)
-
+            for entry in st.session_state.monitoring_history:
+                row = {'Time': entry['timestamp'].strftime('%m/%d/%y %H:%M'), 'Location': entry['location']}
+                prob_values = [entry['probabilities'].get(name, 0) for name in selected_models if name in entry['probabilities']]
+                for name in selected_models:
+                    if name in entry['predictions']:
+                        row[name] = f"{'🚨' if entry['predictions'][name] else '✅'} ({entry['probabilities'][name]:.0%})"
                 if prob_values:
-                    avg_prob = sum(prob_values)/len(prob_values)
-                    row["Average Probability"] = f"{'🚨' if avg_prob > 0.5 else '✅'}  {avg_prob:.1%}"
-                else:
-                    row["Average Probability"] = "N/A"    
+                    avg_prob = sum(prob_values) / len(prob_values)
+                    row["Average"] = f"{'🚨' if avg_prob > 0.5 else '✅'} ({avg_prob:.0%})"
                 history_data.append(row)
-
             st.dataframe(pd.DataFrame(history_data), use_container_width=True)
 
-        # -------------------- Risk History Chart --------------------
-        if st.session_state.monitoring_history:
-            fig = go.Figure()
-            times = [entry['timestamp'] for entry in st.session_state.monitoring_history]
-            for i, model_name in enumerate(selected_models):
-                probs = [entry['probabilities'].get(model_name, 0) for entry in st.session_state.monitoring_history]
-                fig.add_trace(go.Scatter(
-                    x=times, y=probs, mode='lines+markers', name=model_name,
-                    line=dict(width=3), marker=dict(size=8)
-                ))
-            fig.add_hline(y=0.5, line_dash="dot", line_color="red", annotation_text="Risk Threshold")
-            fig.update_layout(
-                title='Historical Signal Drop Risk Predictions',
-                xaxis_title='Time', yaxis_title='Drop Probability',
-                yaxis=dict(range=[0, 1]), height=500, hovermode='x unified'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        # -------------------- Feature Importance --------------------
-        st.subheader("🔍 Model Feature Importance")
-        tabs = st.tabs(selected_models)
-        for i, model_name in enumerate(selected_models):
-            with tabs[i]:
-                model_data = models[model_name]
-                model = model_data["model"]
-                features = model_data["features"]
-                if hasattr(model, 'feature_importances_'):
-                    importances = model.feature_importances_
-                    df = pd.DataFrame({'Feature': features, 'Importance': importances})
-                    df = df.sort_values("Importance", ascending=True)
-                    fig = px.bar(df, x="Importance", y="Feature", orientation="h",
-                                 title=f"{model_name} Feature Importance")
-                    st.plotly_chart(fig, use_container_width=True)
-                elif hasattr(model, 'coef_'):
-                    df = pd.DataFrame({'Feature': features, 'Coefficient': abs(model.coef_[0])})
-                    df = df.sort_values("Coefficient", ascending=True)
-                    fig = px.bar(df, x="Coefficient", y="Feature", orientation="h",
-                                 title=f"{model_name} Coefficients")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("Feature importance not available for this model.")
-        st.markdown("---")
-
-#------------------------------ Tab 2: Manual Parameter Testing --------------------
-    with tab2:
-        st.header("🔧 Manual Parameter Testing")
-        st.markdown("*Test specific environmental conditions - independent of monitoring tab*")
-        st.info("💡 Manually input weather parameters to test signal drop predictions.")
-
-        # Get feature list from first loaded model
-        features = next(iter(models.values()))["features"]
-        manual_input = {}
-
-        # -------------------- Input Form --------------------
-        with st.form("manual_input_form"):
-            st.subheader("🌦️ Environmental Parameters")
-            col1, col2 = st.columns(2)
-
-            with col1:
-                manual_input["precipitation"] = st.number_input("Precipitation (mm)", 0.0, 50.0, 0.0, step=0.1)
-                manual_input["soil_moisture_9_to_27cm"] = st.number_input("Soil Moisture 9-27cm", 0.0, 1.0, 0.3, step=0.01)
-                manual_input["soil_temperature_54cm"] = st.number_input("Soil Temperature 54cm (°C)", -10.0, 50.0, 15.0, step=0.1)
-                manual_input["dew_point_2m"] = st.number_input("Dew Point (°C)", -20.0, 30.0, 10.0, step=0.1)
-                manual_input["uv_index"] = st.number_input("UV Index", 0.0, 15.0, 3.0, step=0.1)
-
-            with col2:
-                manual_input["evapotranspiration"] = st.number_input("Evapotranspiration (mm)", 0.0, 10.0, 2.0, step=0.01)
-                manual_input["wind_speed_80m"] = st.number_input("Wind Speed 80m (m/s)", 0.0, 50.0, 20.0, step=0.1)
-                manual_input["diffuse_radiation"] = st.number_input("Diffuse Radiation (W/m²)", 0.0, 500.0, 100.0, step=0.5)
-                manual_input["relative_humidity_2m"] = st.number_input("Relative Humidity (%)", 0.0, 100.0, 60.0, step=1.0)
-                manual_input["shortwave_radiation"] = st.number_input("Shortwave Radiation (W/m²)", 0.0, 1000.0, 200.0, step=1.0)
-
-            predict_button = st.form_submit_button("🔮 Predict Signal Status", use_container_width=True)
-
-        # -------------------- Run Prediction --------------------
-        if predict_button:
-            input_df = pd.DataFrame([manual_input])
-            manual_predictions = {}
-            manual_probabilities = {}
-
-            for model_name, model_data in models.items():
-                model_input = input_df.copy()
-
-                # Fill in missing features with 0.0 if needed
-                for feature in model_data["features"]:
-                    if feature not in model_input.columns:
-                        model_input[feature] = 0.0
-                model_input = model_input[model_data["features"]]
-
-                # Predict
-                predictions, probabilities = predict_with_model(model_data, model_input)
-                if predictions is not None:
-                    manual_predictions[model_name] = predictions[0]
-                    manual_probabilities[model_name] = probabilities[0] if probabilities is not None else np.nan
-                else:
-                    st.error(f"❌ Error predicting with {model_name}.")
-
-            # Save results in session
-            st.session_state.manual_results = {
-                "predictions": manual_predictions,
-                "probabilities": manual_probabilities,
-                "input": manual_input,
-                "timestamp": datetime.now()
-            }
-
-        # -------------------- Display Results --------------------
-        if st.session_state.manual_results:
-            results = st.session_state.manual_results
-            st.subheader("🎯 Prediction Results")
-
-            result_cols = st.columns(len(results["predictions"]))
-            for i, (model_name, prediction) in enumerate(results["predictions"].items()):
-                probability = results["probabilities"][model_name]
-                color = "red" if prediction == 1 else "green"
-                label = "🚨 SIGNAL DROP" if prediction == 1 else "✅ STABLE"
-
-                with result_cols[i]:
-                    st.markdown(f"""
-                    <div style="padding: 15px; border-radius: 10px;
-                        background-color: rgba({255 if prediction else 0}, {0 if prediction else 255}, 0, 0.1);
-                        border: 2px solid {color}; text-align: center; text-size: clamp width:100%; ">
-                        <h4>{model_name}</h4>
-                        <h3 style="color: {color};">{label}</h3>
-                        <h4>{probability:.1%} probability</h4>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            # -------------------- Model Comparison --------------------
-            if len(results["predictions"]) > 1:
-                st.subheader("📊 Model Comparison")
-
-                comparison_df = pd.DataFrame({
-                    "Model": list(results["predictions"].keys()),
-                    "Prediction": ["Signal Drop" if p == 1 else "Stable" for p in results["predictions"].values()],
-                    "Probability": list(results["probabilities"].values())
-                })
-
-                fig = px.bar(
-                    comparison_df, x="Model", y="Probability", color="Prediction",
-                    color_discrete_map={"Signal Drop": "red", "Stable": "green"},
-                    title="Signal Drop Probability by Model"
-                )
-                fig.add_hline(y=0.5, line_dash="dash", line_color="orange", annotation_text="Decision Threshold")
+            chart_df = pd.DataFrame([{"time": e['timestamp'], "model": name, "probability": prob} for e in st.session_state.monitoring_history for name, prob in e['probabilities'].items() if name in selected_models])
+            if not chart_df.empty:
+                fig = px.line(chart_df, x='time', y='probability', color='model', markers=True, title="Historical Signal Drop Risk")
+                fig.add_hline(y=0.5, line_dash="dot", line_color="red", annotation_text="Risk Threshold")
                 st.plotly_chart(fig, use_container_width=True)
 
-                # -------------------- Summary Metrics --------------------
-                st.subheader("📈 Prediction Summary")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    avg_prob = np.mean(list(results["probabilities"].values()))
-                    st.metric("Average probability", f"{avg_prob:.1%}")
-                with col2:
-                    drop_count = sum(1 for p in results["predictions"].values() if p == 1)
-                    st.metric("Models Predicting Drop", f"{drop_count}/{len(results['predictions'])}")
-                with col3:
-                    max_prob = max(results["probabilities"].values())
-                    st.metric("Highest probability", f"{max_prob:.1%}")
+            st.divider()
+            st.subheader("🔍 Model Feature Importance")
+            fi_tabs = st.tabs(selected_models)
+            for i, name in enumerate(selected_models):
+                with fi_tabs[i]:
+                    model_obj, features = models[name]["model"], models[name]["features"]
+                    if hasattr(model_obj, 'feature_importances_'):
+                        df = pd.DataFrame({'Feature': features, 'Importance': model_obj.feature_importances_}).sort_values("Importance", ascending=True)
+                        st.plotly_chart(px.bar(df, x="Importance", y="Feature", orientation="h", title=f"{name} Feature Importance"), use_container_width=True)
+                    elif hasattr(model_obj, 'coef_'):
+                        df = pd.DataFrame({'Feature': features, 'Coefficient': abs(model_obj.coef_[0])}).sort_values("Coefficient", ascending=True)
+                        st.plotly_chart(px.bar(df, x="Coefficient", y="Feature", orientation="h", title=f"{name} Feature Coefficients"), use_container_width=True)
 
-        # -------------------- Footer --------------------
-        st.markdown("---")
-        st.markdown(f"*Weather-Based Signal Monitor | Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Location: {latitude:.3f}, {longitude:.3f}*")
+    with tab2:
+        st.header("🔧 Manual Parameter Testing")
+        with st.form("manual_input_form"):
+            manual_input = {}
+            cols = st.columns(4)
+            for i, feature in enumerate(FINAL_FEATURES):
+                manual_input[feature] = cols[i % 4].number_input(feature, value=0.0, step=0.1, key=f"manual_{feature}")
+            if st.form_submit_button("🔮 Predict Signal Status", use_container_width=True, type="primary"):
+                input_df = pd.DataFrame([manual_input])
+                st.subheader("🎯 Manual Prediction Results")
+                res_cols = st.columns(len(models))
+                for i, (name, data) in enumerate(models.items()):
+                    pred, prob = predict_with_model(data, input_df)
+                    with res_cols[i]:
+                        if pred is not None:
+                            status, color, bg = ("🚨 SIGNAL DROP", "red", "rgba(255,0,0,0.1)") if pred[0] == 1 else ("✅ STABLE", "green", "rgba(0,255,0,0.1)")
+                            st.markdown(f'<div style="border: 2px solid {color}; background-color: {bg}; border-radius: 10px; padding: 1rem; text-align: center; height: 100%;"><h3>{name}</h3><h2 style="color:{color};">{status}</h2><h4>{prob[0]:.1%} probability</h4></div>', unsafe_allow_html=True)
+                            
+    with tab3:
+        st.header("🦾 Model Retraining with New Data")
+        
+        uploaded_file = st.file_uploader("📁 Upload CSV ('time' or '_time', and 'Rx_EsNo')", type=["csv"])
+        c1, c2 = st.columns(2)
+        user_lat = c1.number_input("Latitude of data location", format="%.4f", value=15.4719, key="retrain_lat")
+        user_lon = c2.number_input("Longitude of data location", format="%.4f", value=98.6433, key="retrain_lon")
+        
+        if st.button("🚀 Start Retraining", disabled=(uploaded_file is None), use_container_width=True, type="primary"):
+            def haversine_km(lat1, lon1, lat2, lon2):
+                lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+                a = math.sin((lat2-lat1)/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin((lon2-lon1)/2)**2
+                return 6371 * 2 * math.asin(math.sqrt(a))
+            
+            with st.spinner("Executing new retraining pipeline..."):
+                STATION_LAT, STATION_LON, DROP_DELTA_DB, RANDOM_STATE = 14.0535, 100.332, 1.3, 42
+                
+                signal_df = pd.read_csv(uploaded_file)
+                if "_time" in signal_df.columns: signal_df.rename(columns={"_time": "time"}, inplace=True)
+                if "Rx EsNo" in signal_df.columns: signal_df.rename(columns={"Rx EsNo": "Rx_EsNo"}, inplace=True)
+                
+                signal_df["time"] = pd.to_datetime(signal_df["time"], errors='coerce').dt.floor('h')
+                signal_df.dropna(subset=["time", "Rx_EsNo"], inplace=True)
+                
+                distance = haversine_km(user_lat, user_lon, STATION_LAT, STATION_LON)
+                baseline_db = -0.0087 * distance + 17.77
+                signal_df["drop"] = (signal_df["Rx_EsNo"] <= (baseline_db - DROP_DELTA_DB)).astype(int)
 
+                start_date, end_date = signal_df['time'].min(), signal_df['time'].max()
+                api_to_use = "archive" if start_date < (datetime.now() - timedelta(days=60)) else "forecast"
+                st.info(f"Data is {'older than 60 days' if api_to_use == 'archive' else 'recent'}. Using the Open-Meteo **{api_to_use}** API.")
+
+                weather_df = fetch_weather_data(user_lat, user_lon, start_date, end_date, api=api_to_use)
+                if weather_df.empty: st.stop()
+
+                missing_features = set(FINAL_FEATURES) - set(weather_df.columns)
+                if missing_features:
+                    st.warning(f"API did not return: {', '.join(missing_features)}. These will be filled with 0.")
+                    for feature in missing_features: weather_df[feature] = 0.0
+
+                merged_df = pd.merge(signal_df, weather_df, on="time", how="inner")
+                X_all = merged_df[FINAL_FEATURES]; y_all = merged_df["drop"]
+
+                drop_counts = y_all.value_counts()
+                st.info(f"Data Labeling Results: Stable Signals (0): {drop_counts.get(0, 0)}, Signal Drops (1): {drop_counts.get(1, 0)}")
+                if y_all.nunique() < 2:
+                    st.error("Training Failed: The provided data resulted in only one class. Models require examples of both signal drops and stable signals to learn.")
+                    st.stop()
+                
+                X_train, X_test, y_train, y_test = train_test_split(X_all, y_all, test_size=0.2, random_state=RANDOM_STATE, stratify=y_all)
+                
+                imputer = SimpleImputer(strategy='median')
+                X_train_imputed = imputer.fit_transform(X_train)
+                X_test_imputed = imputer.transform(X_test)
+                
+                retrained_models, performance_data = {}, []
+
+                for name, data in models.items():
+                    original_scaler = data['scaler']
+                    X_test_scaled_for_orig = original_scaler.transform(X_test_imputed)
+                    y_pred_orig, _ = predict_with_model(data, pd.DataFrame(X_test_scaled_for_orig, columns=FINAL_FEATURES))
+                    
+                    new_scaler = StandardScaler().fit(X_train_imputed)
+                    X_train_scaled, X_test_scaled = new_scaler.transform(X_train_imputed), new_scaler.transform(X_test_imputed)
+                    
+                    if y_train.value_counts().min() > 6:
+                        smt = SMOTETomek(random_state=RANDOM_STATE)
+                        X_train_bal, y_train_bal = smt.fit_resample(X_train_scaled, y_train)
+                    else:
+                        X_train_bal, y_train_bal = X_train_scaled, y_train
+
+                    new_model = deepcopy(data['model'])
+                    new_model.fit(X_train_bal, y_train_bal)
+                    y_pred_new = new_model.predict(X_test_scaled)
+
+                    performance_data.append({
+                        "Model": name, "Original F1": f1_score(y_test, y_pred_orig), "Retrained F1": f1_score(y_test, y_pred_new),
+                        "Original Precision": precision_score(y_test, y_pred_orig, zero_division=0), "Retrained Precision": precision_score(y_test, y_pred_new, zero_division=0),
+                        "Original Recall": recall_score(y_test, y_pred_orig, zero_division=0), "Retrained Recall": recall_score(y_test, y_pred_new, zero_division=0)
+                    })
+                    retrained_models[name] = {"features": FINAL_FEATURES, "scaler": new_scaler, "model": new_model, "threshold": 0.5}
+                
+                st.session_state.retraining_results = {"performance": performance_data, "models": retrained_models}
+                st.rerun()
+
+        if st.session_state.retraining_results:
+            st.subheader("📊 Performance Comparison & Model Selection")
+            with st.form("model_selection_form"):
+                user_choices = {}
+                perf_df = pd.DataFrame(st.session_state.retraining_results["performance"])
+
+                for _, row in perf_df.iterrows():
+                    name = row["Model"]
+                    st.markdown(f"--- \n ### 🔍 **{name}**")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**Original Model Performance**")
+                        st.metric("F1-Score", f"{row['Original F1']:.3f}")
+                    with col2:
+                        st.markdown("**Retrained Model Performance**")
+                        st.metric("F1-Score", f"{row['Retrained F1']:.3f}", delta=f"{row['Retrained F1'] - row['Original F1']:.3f}")
+                    
+                    user_choices[name] = st.radio(f"Choose version for **{name}**:", ("Keep Original", "Save Retrained"), key=f"select_{name}", horizontal=True)
+                
+                st.divider()
+                if st.form_submit_button("💾 Save All Chosen Versions", use_container_width=True, type="primary"):
+                    with st.spinner("Saving models..."):
+                        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                        for name, choice in user_choices.items():
+                            if choice == "Save Retrained":
+                                new_filename = f"{MODEL_BASE_NAMES[name]}_{timestamp}.pkl"
+                                full_path = os.path.abspath(new_filename)
+                                joblib.dump(st.session_state.retraining_results["models"][name], new_filename)
+                                st.success(f"✅ Saved **{name}** to `{full_path}`.")
+                            else:
+                                st.info(f"Keeping original model for **{name}**.")
+                    
+                    del st.session_state.retraining_results
+                    st.success("Process complete! Refresh the page to load the latest models.")
+                    st.balloons()
+                    st.rerun()
 
 if __name__ == "__main__":
     main()

@@ -2,7 +2,10 @@ streamlit
 streamlit-autorefresh
 pandas
 numpy
-scikit-learn
-xgboost
 requests
 plotly
+scikit-learn
+imbalanced-learn
+xgboost
+joblib
+streamlit-option-menu
