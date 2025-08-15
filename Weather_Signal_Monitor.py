@@ -328,7 +328,11 @@ def main():
                 signal_df["drop"] = (signal_df["Rx_EsNo"] <= (baseline_db - DROP_DELTA_DB)).astype(int)
 
                 start_date, end_date = signal_df['time'].min(), signal_df['time'].max()
-                api_to_use = "archive" if start_date < (datetime.now(BKK_TZ) - timedelta(days=60)) else "forecast"
+                
+                # --- THE FIX: Make datetime objects timezone-naive for comparison ---
+                two_months_ago_naive = (datetime.now(BKK_TZ) - timedelta(days=60)).replace(tzinfo=None)
+                api_to_use = "archive" if start_date < two_months_ago_naive else "forecast"
+                
                 st.info(f"Data is {'older than 60 days' if api_to_use == 'archive' else 'recent'}. Using the Open-Meteo **{api_to_use}** API.")
 
                 weather_df = fetch_weather_data(user_lat, user_lon, start_date, end_date, api=api_to_use)
@@ -350,8 +354,8 @@ def main():
                 X_train, X_test, y_train, y_test = train_test_split(X_all, y_all, test_size=0.2, random_state=RANDOM_STATE, stratify=y_all)
                 
                 imputer = SimpleImputer(strategy='median')
-                X_train_imputed = imputer.fit_transform(X_train)
-                X_test_imputed = imputer.transform(X_test)
+                X_train = imputer.fit_transform(X_train)
+                X_test = imputer.transform(X_test)
                 
                 retrained_models, performance_data = {}, []
 
@@ -363,8 +367,8 @@ def main():
                     
                     y_pred_orig, _ = predict_with_model(original_bundle, pd.DataFrame(X_test, columns=FINAL_FEATURES))
                     
-                    new_scaler = StandardScaler().fit(X_train_imputed)
-                    X_train_scaled, X_test_scaled = new_scaler.transform(X_train_imputed), new_scaler.transform(X_test_imputed)
+                    new_scaler = StandardScaler().fit(X_train)
+                    X_train_scaled, X_test_scaled = new_scaler.transform(X_train), new_scaler.transform(X_test)
                     
                     if y_train.value_counts().min() > 6:
                         smt = SMOTETomek(random_state=RANDOM_STATE)
